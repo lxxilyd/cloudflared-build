@@ -26,6 +26,11 @@ env:
   # Must be >= the `go` directive in upstream's go.mod. build.sh checks this at
   # run time and fails with a clear message when it is too old.
   GO_VERSION: "1.27.3"
+  # The canonical repo lives on Gitea and GitHub is a push mirror of it. A mirror
+  # push prunes every ref that does not exist on the source side, so anything
+  # created here (release branch, tag) has to be written back to Gitea - a pruned
+  # tag silently turns the GitHub release back into a draft.
+  GITEA_URL: "https://git.lixxing.top"
 
 jobs:
   prepare:
@@ -129,6 +134,23 @@ jobs:
 
           echo "- snapshot: \`release/${TAG}\` = upstream ${SHORT:-?} + patch" >> "$GITHUB_STEP_SUMMARY"
 
+      # Without this the branch only exists on the mirror, and the next push to
+      # Gitea prunes it.
+      - name: Push release branch to Gitea
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEA_TOKEN:-}" ]; then
+            echo "::warning::GITEA_TOKEN is not set - release/${TAG} exists on GitHub only and a mirror sync will drop it"
+            exit 0
+          fi
+          host="${GITEA_URL#*://}"
+          url="https://${GITEA_TOKEN}@${host}/${GITHUB_REPOSITORY}.git"
+          # The token rides in the URL, so mask it before git can echo it back.
+          git push --force "$url" "HEAD:refs/heads/release/${TAG}" 2>&1 | sed "s|${GITEA_TOKEN}|***|g"
+
   build:
     name: build ${{ matrix.goos }}-${{ matrix.goarch }}
     needs: prepare
@@ -215,3 +237,27 @@ jobs:
           overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same reason as the branch above: the tag is created by the release action
+      # on the mirror only, so it has to be recreated on the source side.
+      - name: Create tag on Gitea
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEA_TOKEN:-}" ]; then
+            echo "::warning::GITEA_TOKEN is not set - tag ${TAG} exists on GitHub only and a mirror sync will drop it"
+            exit 0
+          fi
+          host="${GITEA_URL#*://}"
+          api="https://${host}/api/v1/repos/${GITHUB_REPOSITORY}"
+          auth="Authorization: token ${GITEA_TOKEN}"
+
+          # Gitea has no upsert for tags, so a rebuild (same tag, new commit)
+          # needs the stale one removed first. 404 on delete is expected.
+          curl -s -o /dev/null -X DELETE -H "$auth" "$api/tags/${TAG}" || true
+          curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
+            -d "{\"tag_name\":\"${TAG}\",\"target\":\"${GITHUB_SHA}\"}" \
+            "$api/tags" > /dev/null
+          echo "- gitea: tag \`${TAG}\` -> ${GITHUB_SHA:0:8}" >> "$GITHUB_STEP_SUMMARY"

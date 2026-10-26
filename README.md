@@ -38,6 +38,10 @@ ingress/icmp_posix.go
 11 个目标全部在 ubuntu 交叉编译（`CGO_ENABLED=0`），全部成功后才由 `publish` 创建 release
 并上传所有产物。任一目标失败则不发布。
 
+CI 在 GitHub 跑，仓库本体在 Gitea，而 Gitea 的 push mirror 会删掉源端没有的 ref（tag 被删
+release 就退回 draft）。所以 `release/<tag>` 分支和 tag 都会回推一份到 Gitea，需要 secret
+`GITEA_TOKEN`（Gitea 令牌，`repository` 读写）；没配就跳过，只打一条 warning。
+
 ## 分支
 
 发布时会把打完补丁的树推到 `release/<tag>`：单条提交，提交信息带上游 commit sha，
