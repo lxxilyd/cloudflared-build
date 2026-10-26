@@ -66,16 +66,25 @@ GOOS=freebsd GOARCH=arm64 ./build.sh 2026.10.3
 
 ## 想看代码
 
-只有二进制不方便，所以每次构建还会把**打完补丁的那棵树**推到 `release/<tag>` 分支。
-那是 orphan 分支，里面就是"该 tag 的上游源码 + 补丁"，不含本仓库自己的文件：
+每次构建还会把**打完补丁的那棵树**推到 `release/<tag>` 分支（orphan 分支），
+方便直接在网页上翻代码、搜函数：
 
 ```bash
 git fetch origin 'refs/heads/release/*:refs/remotes/origin/release/*'
 git diff <上游tag>..origin/release/2026.10.3 --stat    # 应该只有上面那 6 个文件
 ```
 
-它和产物来自同一次打补丁的结果，所以看到的代码就是编译的代码。分支只用来阅读，
-构建永远走 tarball，不依赖它。
+它和产物来自同一次打补丁的结果，所以看到的代码就是编译的代码。
+
+分支里少了 `.github/`：上游 tarball 自带 `.github/workflows/`，把这类文件推到仓库需要
+token 具备 `workflows` 权限。一份只读镜像不值得为上游的 CI 配置开这个权限，所以推之前删掉了。
+
+只想本地看一眼、不建分支的话：
+
+```bash
+./build.sh --snapshot /tmp/tree 2026.10.3
+diff -r <上游解压目录> /tmp/tree
+```
 
 ## 上游变了怎么办
 

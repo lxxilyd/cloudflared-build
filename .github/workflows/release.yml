@@ -71,39 +71,44 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "build=$build" >> "$GITHUB_OUTPUT"
 
+  # Read-only mirror of the exact tree the binaries are built from, so the code
+  # can be browsed and diffed against upstream.
   snapshot:
-    name: snapshot release/${{ needs.prepare.outputs.tag }}
+    name: release/${{ needs.prepare.outputs.tag }}
     needs: prepare
     if: needs.prepare.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Export patched tree
+      - name: Export and push release branch
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
           # Snapshot mode never compiles, but build.sh resolves the target early;
-          # providing these avoids needing a Go toolchain in this job.
+          # these avoid needing a Go toolchain in this job.
           GOOS: linux
           GOARCH: amd64
         run: |
           set -euo pipefail
+
           bash ./build.sh --snapshot /tmp/tree "$TAG"
+
+          # Pushing a commit that adds or edits .github/workflows/* requires the
+          # `workflows` permission on GITHUB_TOKEN, which this workflow does not
+          # request. A read-only mirror does not need upstream's CI config.
+          rm -rf /tmp/tree/.github
+
           git checkout --orphan "release/${TAG}"
-          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
           cp -R /tmp/tree/. .
 
-      - name: Push release branch
-        env:
-          TAG: ${{ needs.prepare.outputs.tag }}
-        run: |
-          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add -A
-          git commit -q -m "release ${TAG}: upstream tarball + custom/bsd patch"
+          git commit -q -m "release ${TAG}: upstream ${TAG} + custom/bsd patch"
           git push --force origin "HEAD:refs/heads/release/${TAG}"
-          echo "release/${TAG} now mirrors the tree the binaries were built from" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "- snapshot: \`release/${TAG}\` = upstream ${TAG} + patch" >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: build ${{ matrix.goos }}-${{ matrix.goarch }}
