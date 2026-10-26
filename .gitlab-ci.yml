@@ -1,0 +1,78 @@
+variables:
+  GO_VERSION: "1.27.3"
+  MAC_GO_VERSION: "go@$GO_VERSION"
+  WIN_GO_VERSION: "go$GO_VERSION"
+  GIT_DEPTH: "0"
+  # Athens caches public modules for faster CI downloads; direct preserves public fallback.
+  GOPROXY: "https://athens.cfdata.org|https://proxy.golang.org|direct"
+  GOMODCACHE: "$CI_PROJECT_DIR/.cache/go/pkg/mod"
+  GOCACHE: "$CI_PROJECT_DIR/.cache/go/build"
+
+default:
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: https://vault.cfdata.org
+
+stages:
+  [
+    sync,
+    pre-build,
+    build,
+    validate,
+    test,
+    package,
+    release,
+    release-internal,
+    review,
+  ]
+
+include:
+  #####################################################
+  ########## Import Commons Configurations ############
+  #####################################################
+  - local: .ci/commons.gitlab-ci.yml
+
+  #####################################################
+  ########### Sync Repository with Github #############
+  #####################################################
+  - local: .ci/github.gitlab-ci.yml
+
+  #####################################################
+  ############# Build or Fetch CI Image ###############
+  #####################################################
+  - local: .ci/ci-image.gitlab-ci.yml
+
+  #####################################################
+  ################## Linux Builds ###################
+  #####################################################
+  - local: .ci/linux.gitlab-ci.yml
+
+  #####################################################
+  ################## Windows Builds ###################
+  #####################################################
+  - local: .ci/windows.gitlab-ci.yml
+
+  #####################################################
+  ################### macOS Builds ####################
+  #####################################################
+  - local: .ci/mac.gitlab-ci.yml
+
+  #####################################################
+  ################# Release Packages ##################
+  #####################################################
+  - local: .ci/release.gitlab-ci.yml
+
+  #####################################################
+  ########## Release Packages Internally ##############
+  #####################################################
+  - local: .ci/apt-internal.gitlab-ci.yml
+
+  #####################################################
+  ########## Release Internal Docker Image ############
+  #####################################################
+  - local: .ci/internal-image.gitlab-ci.yml
+
+  #####################################################
+  ############## Manual Claude Review #################
+  #####################################################
+  - component: $CI_SERVER_FQDN/cloudflare/ci/ai/review@~latest
