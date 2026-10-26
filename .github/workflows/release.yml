@@ -34,6 +34,8 @@ jobs:
     outputs:
       tag: ${{ steps.decide.outputs.tag }}
       build: ${{ steps.decide.outputs.build }}
+      sha: ${{ steps.decide.outputs.sha }}
+      short_sha: ${{ steps.decide.outputs.short_sha }}
     steps:
       - name: Resolve tag and decide
         id: decide
@@ -66,10 +68,19 @@ jobs:
             build=false
           fi
 
+          # Which upstream commit is this tag? Needed because the tarball carries
+          # no git metadata, and the release branch keeps only a snapshot commit.
+          sha=$(curl -fsSL "https://api.github.com/repos/cloudflare/cloudflared/commits/${tag}" |
+            grep -oE '"sha": *"[0-9a-f]{40}"' | head -1 | sed 's/.*"\([0-9a-f]*\)"$/\1/' || true)
+          short_sha=$(printf '%s' "$sha" | cut -c1-8)
+
           echo "tag=${tag} release_exists=${exists} force=${INPUT_FORCE:-<unset>} tag_input=${INPUT_TAG:-<empty>}"
+          echo "upstream commit: ${sha:-<unknown>}"
           echo "decision: build=${build}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
 
   # Read-only mirror of the exact tree the binaries are built from, so the code
   # can be browsed and diffed against upstream.
@@ -84,6 +95,8 @@ jobs:
       - name: Export and push release branch
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          SHORT: ${{ needs.prepare.outputs.short_sha }}
           # Snapshot mode never compiles, but build.sh resolves the target early;
           # these avoid needing a Go toolchain in this job.
           GOOS: linux
@@ -105,10 +118,16 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add -A
-          git commit -q -m "release ${TAG}: upstream ${TAG} + custom/bsd patch"
+          subject="release ${TAG}: upstream ${SHORT} + custom/bsd patch"
+          if [ -n "$SHA" ]; then
+            git commit -q -m "$subject" \
+              -m "upstream commit: https://github.com/cloudflare/cloudflared/commit/${SHA}"
+          else
+            git commit -q -m "$subject"
+          fi
           git push --force origin "HEAD:refs/heads/release/${TAG}"
 
-          echo "- snapshot: \`release/${TAG}\` = upstream ${TAG} + patch" >> "$GITHUB_STEP_SUMMARY"
+          echo "- snapshot: \`release/${TAG}\` = upstream ${SHORT:-?} + patch" >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: build ${{ matrix.goos }}-${{ matrix.goarch }}
@@ -188,6 +207,9 @@ jobs:
             Built from the pristine upstream tarball of this tag with the patch
             set in `custom/bsd`, which is verified at build time to touch only
             the files listed in `custom/bsd/manifest.txt`.
+
+            - upstream commit: [${{ needs.prepare.outputs.short_sha }}](https://github.com/cloudflare/cloudflared/commit/${{ needs.prepare.outputs.sha }})
+            - source snapshot: `release/${{ needs.prepare.outputs.tag }}`
           files: dist/*
           fail_on_unmatched_files: true
           overwrite_files: true

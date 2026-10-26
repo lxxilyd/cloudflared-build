@@ -74,7 +74,14 @@ git fetch origin 'refs/heads/release/*:refs/remotes/origin/release/*'
 git diff <上游tag>..origin/release/2026.10.3 --stat    # 应该只有上面那 6 个文件
 ```
 
-它和产物来自同一次打补丁的结果，所以看到的代码就是编译的代码。
+它和产物来自同一次打补丁的结果，所以看到的代码就是编译的代码。分支只有一条提交，
+提交信息里带着上游的 commit sha，可以直接点过去对照：
+
+```
+release 2026.10.3: upstream 8cc81c7f + custom/bsd patch
+
+upstream commit: https://github.com/cloudflare/cloudflared/commit/8cc81c7f...
+```
 
 分支里少了 `.github/`：上游 tarball 自带 `.github/workflows/`，把这类文件推到仓库需要
 token 具备 `workflows` 权限。一份只读镜像不值得为上游的 CI 配置开这个权限，所以推之前删掉了。
