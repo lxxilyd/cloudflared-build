@@ -88,7 +88,7 @@ jobs:
           GOARCH: amd64
         run: |
           set -euo pipefail
-          ./build.sh --snapshot /tmp/tree "$TAG"
+          bash ./build.sh --snapshot /tmp/tree "$TAG"
           git checkout --orphan "release/${TAG}"
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           cp -R /tmp/tree/. .
@@ -132,13 +132,19 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          # There is no go.mod / go.sum in this repository (the source is
+          # downloaded at build time), so setup-go's cache has nothing to key on
+          # and only prints "Dependencies file is not found".
+          cache: false
 
       - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           TAG: ${{ needs.prepare.outputs.tag }}
-        run: ./build.sh "$TAG"
+        # Invoked through bash on purpose: the executable bit is easy to lose
+        # when the repo is committed from Windows.
+        run: bash ./build.sh "$TAG"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
