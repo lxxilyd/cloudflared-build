@@ -1,0 +1,184 @@
+name: Build cloudflared (BSD patch)
+
+# Recipe repo: no source is stored here. Every run downloads the pristine
+# upstream tarball for a tag, applies custom/bsd, verifies that the patch only
+# touched the files listed in custom/bsd/manifest.txt, and cross compiles.
+#
+# Every target is cross compiled on ubuntu-latest (CGO is off), so there is no
+# BSD VM involved - and therefore no VM-specific breakage.
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to build (empty = latest)'
+        required: false
+      force:
+        description: 'Rebuild even if the release already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  # Must be >= the `go` directive in upstream's go.mod. build.sh checks this at
+  # run time and fails with a clear message when it is too old.
+  GO_VERSION: "1.27.3"
+
+jobs:
+  prepare:
+    name: resolve tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.decide.outputs.tag }}
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - name: Resolve tag and decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            tag=$(curl -fsSL https://api.github.com/repos/cloudflare/cloudflared/releases/latest |
+              grep -oE '"tag_name": *"[^"]+"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+          fi
+          case "$tag" in
+            ''|[0-9][0-9][0-9][0-9].*) ;;
+            *) echo "::error::unexpected tag: $tag"; exit 1 ;;
+          esac
+
+          exists=false
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            exists=true
+          fi
+
+          # Same loose-typing trap as elsewhere: compare in shell, not in an
+          # expression, because workflow_dispatch booleans arrive as booleans.
+          build=true
+          if [ "$exists" = "true" ] && [ "$INPUT_FORCE" != "true" ] && [ -z "$INPUT_TAG" ]; then
+            build=false
+          fi
+
+          echo "tag=${tag} release_exists=${exists} force=${INPUT_FORCE:-<unset>} tag_input=${INPUT_TAG:-<empty>}"
+          echo "decision: build=${build}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  snapshot:
+    name: snapshot release/${{ needs.prepare.outputs.tag }}
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export patched tree
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          # Snapshot mode never compiles, but build.sh resolves the target early;
+          # providing these avoids needing a Go toolchain in this job.
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          ./build.sh --snapshot /tmp/tree "$TAG"
+          git checkout --orphan "release/${TAG}"
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -R /tmp/tree/. .
+
+      - name: Push release branch
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -q -m "release ${TAG}: upstream tarball + custom/bsd patch"
+          git push --force origin "HEAD:refs/heads/release/${TAG}"
+          echo "release/${TAG} now mirrors the tree the binaries were built from" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: build ${{ matrix.goos }}-${{ matrix.goarch }}
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: arm }
+          - { goos: linux, goarch: mipsle }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: freebsd, goarch: amd64 }
+          - { goos: freebsd, goarch: arm64 }
+          - { goos: openbsd, goarch: amd64 }
+          - { goos: netbsd, goarch: amd64 }
+          - { goos: windows, goarch: amd64 }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: ./build.sh "$TAG"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflared-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: output/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish ${{ needs.prepare.outputs.tag }}
+    needs: [prepare, build]
+    # Publishing only after every target succeeded: a release with half of the
+    # assets is worse than no release at all.
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -la dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          body: |
+            cloudflared **${{ needs.prepare.outputs.tag }}** for FreeBSD, OpenBSD and NetBSD
+            (plus linux, darwin and windows).
+
+            Built from the pristine upstream tarball of this tag with the patch
+            set in `custom/bsd`, which is verified at build time to touch only
+            the files listed in `custom/bsd/manifest.txt`.
+          files: dist/*
+          fail_on_unmatched_files: true
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
