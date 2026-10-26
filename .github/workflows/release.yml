@@ -130,26 +130,33 @@ jobs:
           else
             git commit -q -m "$subject"
           fi
-          git push --force origin "HEAD:refs/heads/release/${TAG}"
+          # Tag the snapshot itself: `git checkout 2026.10.3` then gives the exact
+          # tree the binaries came from, with no tarball step in between.
+          git tag -f "$TAG"
+          git push --force origin "HEAD:refs/heads/release/${TAG}" "refs/tags/${TAG}"
 
           echo "- snapshot: \`release/${TAG}\` = upstream ${SHORT:-?} + patch" >> "$GITHUB_STEP_SUMMARY"
 
-      # Without this the branch only exists on the mirror, and the next push to
-      # Gitea prunes it.
-      - name: Push release branch to Gitea
+      # Without this the branch and tag only exist on the mirror, and the next
+      # push to Gitea prunes them (a pruned tag turns the release back to draft).
+      # Done with git instead of the tags API: same credential as the push above,
+      # and the API rejects a token whose scope Gitea does not enforce for git.
+      - name: Push release branch and tag to Gitea
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${GITEA_TOKEN:-}" ]; then
-            echo "::warning::GITEA_TOKEN is not set - release/${TAG} exists on GitHub only and a mirror sync will drop it"
+            echo "::warning::GITEA_TOKEN is not set - release/${TAG} and tag ${TAG} exist on GitHub only and a mirror sync will drop them"
             exit 0
           fi
           host="${GITEA_URL#*://}"
           url="https://${GITEA_TOKEN}@${host}/${GITHUB_REPOSITORY}.git"
           # The token rides in the URL, so mask it before git can echo it back.
-          git push --force "$url" "HEAD:refs/heads/release/${TAG}" 2>&1 | sed "s|${GITEA_TOKEN}|***|g"
+          git push --force "$url" \
+            "HEAD:refs/heads/release/${TAG}" "refs/tags/${TAG}" 2>&1 |
+            sed "s|${GITEA_TOKEN}|***|g"
 
   build:
     name: build ${{ matrix.goos }}-${{ matrix.goarch }}
@@ -237,27 +244,3 @@ jobs:
           overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Same reason as the branch above: the tag is created by the release action
-      # on the mirror only, so it has to be recreated on the source side.
-      - name: Create tag on Gitea
-        env:
-          TAG: ${{ needs.prepare.outputs.tag }}
-          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GITEA_TOKEN:-}" ]; then
-            echo "::warning::GITEA_TOKEN is not set - tag ${TAG} exists on GitHub only and a mirror sync will drop it"
-            exit 0
-          fi
-          host="${GITEA_URL#*://}"
-          api="https://${host}/api/v1/repos/${GITHUB_REPOSITORY}"
-          auth="Authorization: token ${GITEA_TOKEN}"
-
-          # Gitea has no upsert for tags, so a rebuild (same tag, new commit)
-          # needs the stale one removed first. 404 on delete is expected.
-          curl -s -o /dev/null -X DELETE -H "$auth" "$api/tags/${TAG}" || true
-          curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
-            -d "{\"tag_name\":\"${TAG}\",\"target\":\"${GITHUB_SHA}\"}" \
-            "$api/tags" > /dev/null
-          echo "- gitea: tag \`${TAG}\` -> ${GITHUB_SHA:0:8}" >> "$GITHUB_STEP_SUMMARY"

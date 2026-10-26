@@ -39,8 +39,9 @@ ingress/icmp_posix.go
 并上传所有产物。任一目标失败则不发布。
 
 CI 在 GitHub 跑，仓库本体在 Gitea，而 Gitea 的 push mirror 会删掉源端没有的 ref（tag 被删
-release 就退回 draft）。所以 `release/<tag>` 分支和 tag 都会回推一份到 Gitea，需要 secret
-`GITEA_TOKEN`（Gitea 令牌，`repository` 读写）；没配就跳过，只打一条 warning。
+release 就退回 draft）。所以 `release/<tag>` 分支和 tag 都会用同一个 token 再 `git push`
+一份到 Gitea，需要 secret `GITEA_TOKEN`（Gitea 令牌，`repository` 读写）；没配就跳过，只打
+一条 warning。
 
 ## 分支
 
