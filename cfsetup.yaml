@@ -1,0 +1,2 @@
+# A valid cfsetup.yaml is required but we dont have any real config to specify
+dummy_key: true
