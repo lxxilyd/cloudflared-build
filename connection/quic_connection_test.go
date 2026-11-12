@@ -1,0 +1,1647 @@
+package connection
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gobwas/ws/wsutil"
+	"github.com/google/uuid"
+	pkgerrors "github.com/pkg/errors"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/net/nettest"
+
+	"github.com/cloudflare/cloudflared/connection/dialopts"
+
+	"github.com/cloudflare/cloudflared/client"
+	"github.com/cloudflare/cloudflared/config"
+	cfdflow "github.com/cloudflare/cloudflared/flow"
+
+	"github.com/cloudflare/cloudflared/datagramsession"
+	"github.com/cloudflare/cloudflared/ingress"
+	"github.com/cloudflare/cloudflared/packet"
+	cfdquic "github.com/cloudflare/cloudflared/quic"
+	"github.com/cloudflare/cloudflared/tracing"
+	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
+	rpcquic "github.com/cloudflare/cloudflared/tunnelrpc/quic"
+)
+
+var (
+	testTLSServerConfig = GenerateTLSConfig()
+	testQUICConfig      = &quic.Config{
+		KeepAlivePeriod: 5 * time.Second,
+		EnableDatagrams: true,
+	}
+	defaultQUICTimeout = 30 * time.Second
+)
+
+var _ ReadWriteAcker = (*streamReadWriteAcker)(nil)
+
+// TestQUICServer tests if a quic server accepts and responds to a quic client with the acceptance protocol.
+// It also serves as a demonstration for communication with the QUIC connection started by a cloudflared.
+func TestQUICServer(t *testing.T) {
+	// This is simply a sample websocket frame message.
+	wsBuf := &bytes.Buffer{}
+	err := wsutil.WriteClientBinary(wsBuf, []byte("Hello"))
+	require.NoError(t, err)
+
+	tests := []struct {
+		desc             string
+		dest             string
+		connectionType   pogs.ConnectionType
+		metadata         []pogs.Metadata
+		message          []byte
+		expectedResponse []byte
+	}{
+		{
+			desc:           "test http proxy",
+			dest:           "/ok",
+			connectionType: pogs.ConnectionTypeHTTP,
+			metadata: []pogs.Metadata{
+				{
+					Key: "HttpHeader:Cf-Ray",
+					Val: "123123123",
+				},
+				{
+					Key: "HttpHost",
+					Val: "cf.host",
+				},
+				{
+					Key: "HttpMethod",
+					Val: "GET",
+				},
+			},
+			expectedResponse: []byte("OK"),
+		},
+		{
+			desc:           "test http body request streaming",
+			dest:           "/slow_echo_body",
+			connectionType: pogs.ConnectionTypeHTTP,
+			metadata: []pogs.Metadata{
+				{
+					Key: "HttpHeader:Cf-Ray",
+					Val: "123123123",
+				},
+				{
+					Key: "HttpHost",
+					Val: "cf.host",
+				},
+				{
+					Key: "HttpMethod",
+					Val: "POST",
+				},
+				{
+					Key: "HttpHeader:Content-Length",
+					Val: "24",
+				},
+			},
+			message:          []byte("This is the message body"),
+			expectedResponse: []byte("This is the message body"),
+		},
+		{
+			desc:           "test ws proxy",
+			dest:           "/ws/echo",
+			connectionType: pogs.ConnectionTypeWebsocket,
+			metadata: []pogs.Metadata{
+				{
+					Key: "HttpHeader:Cf-Cloudflared-Proxy-Connection-Upgrade",
+					Val: "Websocket",
+				},
+				{
+					Key: "HttpHeader:Another-Header",
+					Val: "Misc",
+				},
+				{
+					Key: "HttpHost",
+					Val: "cf.host",
+				},
+				{
+					Key: "HttpMethod",
+					Val: "get",
+				},
+			},
+			message:          wsBuf.Bytes(),
+			expectedResponse: []byte{0x82, 0x5, 0x48, 0x65, 0x6c, 0x6c, 0x6f},
+		},
+		{
+			desc:             "test tcp proxy",
+			connectionType:   pogs.ConnectionTypeTCP,
+			metadata:         []pogs.Metadata{},
+			message:          []byte("Here is some tcp data"),
+			expectedResponse: []byte("Here is some tcp data"),
+		},
+	}
+
+	for i, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			// Start a UDP Listener for QUIC.
+			udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+			require.NoError(t, err)
+			udpListener, err := net.ListenUDP(udpAddr.Network(), udpAddr)
+			require.NoError(t, err)
+			defer func() { _ = udpListener.Close() }()
+			quicTransport := &quic.Transport{Conn: udpListener, ConnectionIDLength: 16}
+			quicListener, err := quicTransport.Listen(testTLSServerConfig, testQUICConfig)
+			require.NoError(t, err)
+
+			serverDone := make(chan struct{})
+			go func() {
+				// nolint: testifylint
+				quicServer(
+					ctx, t, quicListener, test.dest, test.connectionType, test.metadata, test.message, test.expectedResponse,
+				)
+				close(serverDone)
+			}()
+
+			// nolint: gosec
+			tunnelConn, _ := testTunnelConnection(t, netip.MustParseAddrPort(udpListener.LocalAddr().String()), uint8(i))
+
+			connDone := make(chan struct{})
+			go func() {
+				_ = tunnelConn.Serve(ctx)
+				close(connDone)
+			}()
+
+			<-serverDone
+			cancel()
+			<-connDone
+		})
+	}
+}
+
+func TestRequestBodyCloseReleasesQUICFlowControl(t *testing.T) {
+	const receiveWindow = 16 * 1024
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	edgeFrames := newQUICFrameRecorder()
+	edgeConfig := testQUICConfig.Clone()
+	edgeConfig.Tracer = edgeFrames.traceForConnection
+
+	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	udpListener, err := net.ListenUDP(udpAddr.Network(), udpAddr)
+	require.NoError(t, err)
+	defer func() { _ = udpListener.Close() }()
+
+	quicTransport := &quic.Transport{Conn: udpListener, ConnectionIDLength: 16}
+	quicListener, err := quicTransport.Listen(testTLSServerConfig, edgeConfig)
+	require.NoError(t, err)
+	defer func() { _ = quicListener.Close() }()
+
+	cloudflaredFrames := newQUICFrameRecorder()
+	cloudflaredConfig := testQUICConfig.Clone()
+	cloudflaredConfig.InitialStreamReceiveWindow = receiveWindow
+	cloudflaredConfig.MaxStreamReceiveWindow = receiveWindow
+	cloudflaredConfig.InitialConnectionReceiveWindow = receiveWindow
+	cloudflaredConfig.MaxConnectionReceiveWindow = receiveWindow
+	cloudflaredConfig.Tracer = cloudflaredFrames.traceForConnection
+
+	releaseBody := make(chan struct{})
+	bodyCloseResult := make(chan error, 1)
+	originProxy := &cancelRequestBodyOriginProxy{
+		mockOriginProxyWithRequest: &mockOriginProxyWithRequest{},
+		releaseBody:                releaseBody,
+		bodyCloseResult:            bodyCloseResult,
+	}
+	tunnelConn, _ := testTunnelConnectionWithConfig(
+		t,
+		netip.MustParseAddrPort(udpListener.LocalAddr().String()),
+		31,
+		cloudflaredConfig,
+		originProxy,
+	)
+
+	connDone := make(chan struct{})
+	go func() {
+		defer close(connDone)
+		_ = tunnelConn.Serve(ctx)
+	}()
+
+	edgeConn, err := quicListener.Accept(ctx)
+	require.NoError(t, err)
+
+	firstStream, err := edgeConn.OpenStreamSync(ctx)
+	require.NoError(t, err)
+	firstStreamID := firstStream.StreamID()
+	firstRequest := rpcquic.RequestClientStream{ReadWriteCloser: firstStream}
+	require.NoError(t, firstRequest.WriteConnectRequestData(
+		"/cancel-upload",
+		pogs.ConnectionTypeHTTP,
+		pogs.Metadata{Key: HTTPMethodKey, Val: http.MethodPost},
+		pogs.Metadata{Key: HTTPHostKey, Val: "cf.host"},
+		pogs.Metadata{Key: HTTPHeaderKey + ":Content-Length", Val: strconv.Itoa(4 * receiveWindow)},
+	))
+
+	type writeResult struct {
+		n   int
+		err error
+	}
+	uploadResult := make(chan writeResult, 1)
+	go func() {
+		n, err := firstStream.Write(make([]byte, 4*receiveWindow))
+		uploadResult <- writeResult{n: n, err: err}
+	}()
+
+	waitForQUICFrame(t, edgeFrames.frames, func(event recordedQUICFrame) bool {
+		_, ok := event.frame.(*qlog.DataBlockedFrame)
+		return event.sent && ok
+	})
+	close(releaseBody)
+	require.NoError(t, waitForTestResult(t, bodyCloseResult))
+
+	maxData := waitForCloudflaredCancellationFrames(t, cloudflaredFrames.frames, firstStreamID)
+	waitForEdgeCancellationFrames(t, edgeFrames.frames, firstStreamID)
+	require.Greater(t, int64(maxData.MaximumData), int64(receiveWindow))
+
+	result := waitForTestResult(t, uploadResult)
+	require.Error(t, result.err)
+	require.Less(t, result.n, 4*receiveWindow)
+
+	require.NoError(t, firstStream.SetReadDeadline(time.Now().Add(5*time.Second)))
+	response, err := firstRequest.ReadConnectResponseData()
+	require.NoError(t, err)
+	require.Empty(t, response.Error)
+	responseBody := make([]byte, len(http.StatusText(http.StatusOK)))
+	_, err = io.ReadFull(firstStream, responseBody)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusText(http.StatusOK), string(responseBody))
+
+	secondStream, err := edgeConn.OpenStreamSync(ctx)
+	require.NoError(t, err)
+	secondRequest := rpcquic.RequestClientStream{ReadWriteCloser: secondStream}
+	require.NoError(t, secondRequest.WriteConnectRequestData(
+		"/second-request",
+		pogs.ConnectionTypeHTTP,
+		pogs.Metadata{Key: HTTPMethodKey, Val: http.MethodGet},
+		pogs.Metadata{Key: HTTPHostKey, Val: "cf.host"},
+	))
+	require.NoError(t, secondStream.SetReadDeadline(time.Now().Add(5*time.Second)))
+	response, err = secondRequest.ReadConnectResponseData()
+	require.NoError(t, err)
+	require.Empty(t, response.Error)
+	_, err = io.ReadFull(secondStream, responseBody)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusText(http.StatusOK), string(responseBody))
+
+	cancel()
+	waitForTestResult(t, connDone)
+}
+
+type fakeControlStream struct {
+	ControlStreamHandler
+	serveError error
+	complete   bool
+}
+
+func (f fakeControlStream) ServeControlStream(ctx context.Context, rw io.ReadWriteCloser, connOptions *pogs.ConnectionOptions, tunnelConfigGetter TunnelConfigJSONGetter) error {
+	if f.serveError != nil {
+		return f.serveError
+	}
+	if f.complete {
+		return nil
+	}
+	<-ctx.Done()
+	return nil
+}
+
+func (fakeControlStream) IsStopped() bool {
+	return false
+}
+
+type fakeDatagramHandler struct {
+	pogs.SessionManager
+	serveError error
+}
+
+func (f fakeDatagramHandler) Serve(context.Context) error {
+	return f.serveError
+}
+
+func TestControlStreamClassifiesDuplicateRegistration(t *testing.T) {
+	t.Parallel()
+
+	rpcClientFactory := mockRPCClientFactory{
+		shouldFail: errors.New(DuplicateConnectionError),
+	}
+	controlStream := NewControlStream(
+		NewObserver(&log),
+		mockConnectedFuse{},
+		&TunnelProperties{},
+		0,
+		nil,
+		rpcClientFactory.newMockRPCClient,
+		time.Second,
+		nil,
+		0,
+		QUIC,
+	)
+
+	err := controlStream.ServeControlStream(t.Context(), &mockReaderNoopWriter{}, &pogs.ConnectionOptions{}, nil)
+	require.ErrorIs(t, err, ErrDuplicateConnection)
+}
+
+type openStreamErrorQUICConnection struct {
+	cfdquic.QUICConnection
+	err error
+}
+
+func (c *openStreamErrorQUICConnection) OpenStream() (*quic.Stream, error) {
+	return nil, c.err
+}
+
+func TestQUICConnectionOpenControlStreamError(t *testing.T) {
+	t.Parallel()
+
+	streamLimitErr := &quic.StreamLimitReachedError{}
+	tests := []struct {
+		name             string
+		openStreamErr    error
+		target           error
+		cancelContext    bool
+		wantControlError bool
+	}{
+		{
+			name:             "stream limit reached",
+			openStreamErr:    streamLimitErr,
+			target:           streamLimitErr,
+			wantControlError: true,
+		},
+		{
+			name:             "connection canceled while context remains active",
+			openStreamErr:    fmt.Errorf("open stream: %w", context.Canceled),
+			target:           context.Canceled,
+			wantControlError: true,
+		},
+		{
+			name:             "serving context canceled remains wrapped",
+			openStreamErr:    fmt.Errorf("open stream: %w", context.Canceled),
+			target:           context.Canceled,
+			cancelContext:    true,
+			wantControlError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := t.Context()
+			if tc.cancelContext {
+				canceledCtx, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = canceledCtx
+			}
+			quicConn := &quicConnection{
+				conn: &openStreamErrorQUICConnection{err: tc.openStreamErr},
+			}
+			err := quicConn.Serve(ctx)
+
+			require.ErrorIs(t, err, tc.target)
+			_, isControlError := errors.AsType[*ControlStreamError](err)
+			assert.Equal(t, tc.wantControlError, isControlError)
+		})
+	}
+}
+
+func TestQUICConnectionReturnsRegistrationError(t *testing.T) {
+	t.Parallel()
+
+	quicConn, ctx, cancel := newTestQUICConnection(t)
+	defer cancel()
+
+	expectedCause := errors.New("Unauthorized: Invalid tunnel secret")
+	expectedErr := ServerRegisterTunnelError{Cause: expectedCause, Permanent: true}
+	quicConn.controlStreamHandler = fakeControlStream{serveError: expectedErr}
+	logBuffer := &bytes.Buffer{}
+	logger := zerolog.New(logBuffer)
+	quicConn.logger = &logger
+
+	err := quicConn.Serve(ctx)
+
+	// The failure is wrapped in a ControlStreamError so the supervisor can classify
+	// it, while the underlying registration error remains reachable and printable.
+	var controlStreamErr *ControlStreamError
+	require.ErrorAs(t, err, &controlStreamErr, "expected *ControlStreamError, got %T", err)
+
+	var registrationErr ServerRegisterTunnelError
+	require.ErrorAs(t, err, &registrationErr)
+	assert.Same(t, expectedCause, registrationErr.Cause)
+	assert.True(t, registrationErr.Permanent)
+	require.ErrorIs(t, err, expectedCause)
+
+	require.EqualError(t, err, "control stream error: "+expectedCause.Error())
+	assert.Empty(t, logBuffer.String())
+}
+
+func TestQUICConnectionCancellation(t *testing.T) {
+	t.Parallel()
+
+	quicConn, ctx, cancel := newTestQUICConnection(t)
+	logBuffer := &bytes.Buffer{}
+	logger := zerolog.New(logBuffer)
+	quicConn.logger = &logger
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- quicConn.Serve(ctx)
+	}()
+	cancel()
+
+	err := <-serveDone
+	require.ErrorIs(t, err, context.Canceled)
+	var controlStreamErr *ControlStreamError
+	var streamListenerErr *StreamListenerError
+	var datagramManagerErr *DatagramManagerError
+	assert.True(t,
+		errors.As(err, &controlStreamErr) ||
+			errors.As(err, &streamListenerErr) ||
+			errors.As(err, &datagramManagerErr),
+		"expected a typed connection error, got %T", err,
+	)
+	assert.Empty(t, logBuffer.String())
+}
+
+func TestQUICConnectionCleanControlStreamCompletion(t *testing.T) {
+	t.Parallel()
+
+	quicConn, ctx, cancel := newTestQUICConnection(t)
+	defer cancel()
+	quicConn.controlStreamHandler = fakeControlStream{complete: true}
+
+	require.NoError(t, quicConn.Serve(ctx))
+}
+
+func TestQUICConnectionUnexpectedDatagramExit(t *testing.T) {
+	t.Parallel()
+
+	quicConn, ctx, cancel := newTestQUICConnection(t)
+	defer cancel()
+	quicConn.datagramHandler = fakeDatagramHandler{}
+
+	err := quicConn.Serve(ctx)
+
+	var datagramErr *DatagramManagerError
+	require.ErrorAs(t, err, &datagramErr)
+	require.EqualError(t, err, "datagram manager error: datagram manager exited unexpectedly")
+}
+
+func TestConnectionErrorTypesUnwrap(t *testing.T) {
+	t.Parallel()
+
+	cause := errors.New("inner")
+	tests := []struct {
+		name   string
+		err    error
+		prefix string
+	}{
+		{"server registration", ServerRegisterTunnelError{Cause: cause}, "inner"},
+		{"control stream", &ControlStreamError{Cause: cause}, "control stream error: inner"},
+		{"stream listener", &StreamListenerError{Cause: cause}, "accept stream listener error: inner"},
+		{"datagram manager", &DatagramManagerError{Cause: cause}, "datagram manager error: inner"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.EqualError(t, tc.err, tc.prefix)
+			assert.ErrorIs(t, tc.err, cause)
+		})
+	}
+}
+
+func newTestQUICConnection(t *testing.T) (*quicConnection, context.Context, context.CancelFunc) {
+	t.Helper()
+
+	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	udpListener, err := net.ListenUDP(udpAddr.Network(), udpAddr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = udpListener.Close() })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	quicListener, err := quic.Listen(udpListener, testTLSServerConfig, testQUICConfig)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = quicListener.Close() })
+
+	type acceptResult struct {
+		conn *quic.Conn
+		err  error
+	}
+	accepted := make(chan acceptResult, 1)
+	go func() {
+		conn, err := quicListener.Accept(ctx)
+		accepted <- acceptResult{conn: conn, err: err}
+	}()
+
+	tunnelConn, _ := testTunnelConnection(t, netip.MustParseAddrPort(udpListener.LocalAddr().String()), 0)
+	result := <-accepted
+	require.NoError(t, result.err)
+	t.Cleanup(func() { _ = result.conn.CloseWithError(0, "") })
+	quicConn, ok := tunnelConn.(*quicConnection)
+	require.True(t, ok)
+	return quicConn, ctx, cancel
+}
+
+func quicServer(
+	ctx context.Context,
+	t *testing.T,
+	listener *quic.Listener,
+	dest string,
+	connectionType pogs.ConnectionType,
+	metadata []pogs.Metadata,
+	message []byte,
+	expectedResponse []byte,
+) {
+	session, err := listener.Accept(ctx)
+	require.NoError(t, err)
+
+	quicStream, err := session.OpenStreamSync(t.Context())
+	require.NoError(t, err)
+	stream := cfdquic.NewSafeStreamCloser(quicStream, defaultQUICTimeout, &log)
+
+	reqClientStream := rpcquic.RequestClientStream{ReadWriteCloser: stream}
+	err = reqClientStream.WriteConnectRequestData(dest, connectionType, metadata...)
+	require.NoError(t, err)
+
+	_, err = reqClientStream.ReadConnectResponseData()
+	require.NoError(t, err)
+
+	if message != nil {
+		// ALPN successful. Write data.
+		_, err := stream.Write(message)
+		require.NoError(t, err)
+	}
+
+	response := make([]byte, len(expectedResponse))
+	_, err = stream.Read(response)
+	if err != io.EOF {
+		require.NoError(t, err)
+	}
+
+	// For now it is an echo server. Verify if the same data is returned.
+	assert.Equal(t, expectedResponse, response)
+}
+
+type mockOriginProxyWithRequest struct{}
+
+func (moc *mockOriginProxyWithRequest) ProxyHTTP(w ResponseWriter, tr *tracing.TracedHTTPRequest, isWebsocket bool) error {
+	// These are a series of crude tests to ensure the headers and http related data is transferred from
+	// metadata.
+	r := tr.Request
+	if r.Method == "" {
+		return errors.New("method not sent")
+	}
+	if r.Host == "" {
+		return errors.New("host not sent")
+	}
+	if len(r.Header) == 0 {
+		return errors.New("headers not set")
+	}
+
+	if isWebsocket {
+		return wsEchoEndpoint(w, r)
+	}
+	switch r.URL.Path {
+	case "/ok":
+		originRespEndpoint(w, http.StatusOK, []byte(http.StatusText(http.StatusOK)))
+	case "/slow_echo_body":
+		time.Sleep(5 * time.Nanosecond)
+		fallthrough
+	case "/echo_body":
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+		}
+		_ = w.WriteRespHeaders(resp.StatusCode, resp.Header)
+		_, _ = io.Copy(w, r.Body)
+	case "/error":
+		return fmt.Errorf("Failed to proxy to origin")
+	default:
+		originRespEndpoint(w, http.StatusNotFound, []byte("page not found"))
+	}
+	return nil
+}
+
+type cancelRequestBodyOriginProxy struct {
+	*mockOriginProxyWithRequest
+	releaseBody     <-chan struct{}
+	bodyCloseResult chan<- error
+}
+
+func (p *cancelRequestBodyOriginProxy) ProxyHTTP(w ResponseWriter, tr *tracing.TracedHTTPRequest, _ bool) error {
+	select {
+	case <-p.releaseBody:
+	case <-tr.Request.Context().Done():
+		return tr.Request.Context().Err()
+	}
+
+	err := tr.Body.Close()
+	p.bodyCloseResult <- err
+	if err != nil {
+		return err
+	}
+	originRespEndpoint(w, http.StatusOK, []byte(http.StatusText(http.StatusOK)))
+	return nil
+}
+
+func TestBuildHTTPRequest(t *testing.T) {
+	tests := []struct {
+		name           string
+		connectRequest *pogs.ConnectRequest
+		body           io.ReadCloser
+		req            *http.Request
+	}{
+		{
+			name: "check if http.Request is built correctly with content length",
+			connectRequest: &pogs.ConnectRequest{
+				Dest: "http://test.com",
+				Metadata: []pogs.Metadata{
+					{
+						Key: "HttpHeader:Cf-Cloudflared-Proxy-Connection-Upgrade",
+						Val: "Websocket",
+					},
+					{
+						Key: "HttpHeader:Content-Length",
+						Val: "514",
+					},
+					{
+						Key: "HttpHeader:Another-Header",
+						Val: "Misc",
+					},
+					{
+						Key: "HttpHost",
+						Val: "cf.host",
+					},
+					{
+						Key: "HttpMethod",
+						Val: "get",
+					},
+				},
+			},
+			req: &http.Request{
+				Method: "get",
+				URL: &url.URL{
+					Scheme: "http",
+					Host:   "test.com",
+				},
+				Proto:      "HTTP/1.1",
+				ProtoMajor: 1,
+				ProtoMinor: 1,
+				Header: http.Header{
+					"Another-Header": []string{"Misc"},
+					"Content-Length": []string{"514"},
+				},
+				ContentLength: 514,
+				Host:          "cf.host",
+				Body:          io.NopCloser(&bytes.Buffer{}),
+			},
+			body: io.NopCloser(&bytes.Buffer{}),
+		},
+		{
+			name: "if content length isn't part of request headers, then it's not set",
+			connectRequest: &pogs.ConnectRequest{
+				Dest: "http://test.com",
+				Metadata: []pogs.Metadata{
+					{
+						Key: "HttpHeader:Cf-Cloudflared-Proxy-Connection-Upgrade",
+						Val: "Websocket",
+					},
+					{
+						Key: "HttpHeader:Another-Header",
+						Val: "Misc",
+					},
+					{
+						Key: "HttpHost",
+						Val: "cf.host",
+					},
+					{
+						Key: "HttpMethod",
+						Val: "get",
+					},
+				},
+			},
+			req: &http.Request{
+				Method: "get",
+				URL: &url.URL{
+					Scheme: "http",
+					Host:   "test.com",
+				},
+				Proto:      "HTTP/1.1",
+				ProtoMajor: 1,
+				ProtoMinor: 1,
+				Header: http.Header{
+					"Another-Header": []string{"Misc"},
+				},
+				ContentLength: 0,
+				Host:          "cf.host",
+				Body:          http.NoBody,
+			},
+			body: io.NopCloser(&bytes.Buffer{}),
+		},
+		{
+			name: "if content length is 0, but transfer-encoding is chunked, body is not nil",
+			connectRequest: &pogs.ConnectRequest{
+				Dest: "http://test.com",
+				Metadata: []pogs.Metadata{
+					{
+						Key: "HttpHeader:Another-Header",
+						Val: "Misc",
+					},
+					{
+						Key: "HttpHeader:Transfer-Encoding",
+						Val: "chunked",
+					},
+					{
+						Key: "HttpHost",
+						Val: "cf.host",
+					},
+					{
+						Key: "HttpMethod",
+						Val: "get",
+					},
+				},
+			},
+			req: &http.Request{
+				Method: "get",
+				URL: &url.URL{
+					Scheme: "http",
+					Host:   "test.com",
+				},
+				Proto:      "HTTP/1.1",
+				ProtoMajor: 1,
+				ProtoMinor: 1,
+				Header: http.Header{
+					"Another-Header":    []string{"Misc"},
+					"Transfer-Encoding": []string{"chunked"},
+				},
+				ContentLength: 0,
+				Host:          "cf.host",
+				Body:          io.NopCloser(&bytes.Buffer{}),
+			},
+			body: io.NopCloser(&bytes.Buffer{}),
+		},
+		{
+			name: "if content length is 0, but transfer-encoding is gzip,chunked, body is not nil",
+			connectRequest: &pogs.ConnectRequest{
+				Dest: "http://test.com",
+				Metadata: []pogs.Metadata{
+					{
+						Key: "HttpHeader:Another-Header",
+						Val: "Misc",
+					},
+					{
+						Key: "HttpHeader:Transfer-Encoding",
+						Val: "gzip,chunked",
+					},
+					{
+						Key: "HttpHost",
+						Val: "cf.host",
+					},
+					{
+						Key: "HttpMethod",
+						Val: "get",
+					},
+				},
+			},
+			req: &http.Request{
+				Method: "get",
+				URL: &url.URL{
+					Scheme: "http",
+					Host:   "test.com",
+				},
+				Proto:      "HTTP/1.1",
+				ProtoMajor: 1,
+				ProtoMinor: 1,
+				Header: http.Header{
+					"Another-Header":    []string{"Misc"},
+					"Transfer-Encoding": []string{"gzip,chunked"},
+				},
+				ContentLength: 0,
+				Host:          "cf.host",
+				Body:          io.NopCloser(&bytes.Buffer{}),
+			},
+			body: io.NopCloser(&bytes.Buffer{}),
+		},
+		{
+			name: "if content length is 0, and connect request is a websocket, body is not nil",
+			connectRequest: &pogs.ConnectRequest{
+				Type: pogs.ConnectionTypeWebsocket,
+				Dest: "http://test.com",
+				Metadata: []pogs.Metadata{
+					{
+						Key: "HttpHeader:Another-Header",
+						Val: "Misc",
+					},
+					{
+						Key: "HttpHost",
+						Val: "cf.host",
+					},
+					{
+						Key: "HttpMethod",
+						Val: "get",
+					},
+				},
+			},
+			req: &http.Request{
+				Method: "get",
+				URL: &url.URL{
+					Scheme: "http",
+					Host:   "test.com",
+				},
+				Proto:      "HTTP/1.1",
+				ProtoMajor: 1,
+				ProtoMinor: 1,
+				Header: http.Header{
+					"Another-Header": []string{"Misc"},
+				},
+				ContentLength: 0,
+				Host:          "cf.host",
+				Body:          io.NopCloser(&bytes.Buffer{}),
+			},
+			body: io.NopCloser(&bytes.Buffer{}),
+		},
+	}
+
+	log := zerolog.Nop()
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req, err := buildHTTPRequest(t.Context(), test.connectRequest, test.body, 0, &log)
+			require.NoError(t, err)
+			test.req = test.req.WithContext(req.Context())
+			require.Equal(t, test.req, req.Request)
+		})
+	}
+}
+
+func TestBuildHTTPRequestClosesBodylessStream(t *testing.T) {
+	t.Parallel()
+
+	body := &closeTrackingReadCloser{Reader: &bytes.Buffer{}}
+	request := &pogs.ConnectRequest{
+		Type: pogs.ConnectionTypeHTTP,
+		Dest: "http://test.com",
+		Metadata: []pogs.Metadata{
+			{Key: HTTPMethodKey, Val: http.MethodGet},
+			{Key: HTTPHostKey, Val: "cf.host"},
+		},
+	}
+	log := zerolog.Nop()
+
+	req, err := buildHTTPRequest(t.Context(), request, body, 0, &log)
+	require.NoError(t, err)
+	require.Equal(t, http.NoBody, req.Body)
+	require.True(t, body.closed)
+}
+
+func (moc *mockOriginProxyWithRequest) ProxyTCP(ctx context.Context, rwa ReadWriteAcker, tcpRequest *TCPRequest) error {
+	if tcpRequest.Dest == "rate-limit-me" {
+		return pkgerrors.Wrap(cfdflow.ErrTooManyActiveFlows, "failed tcp stream")
+	}
+
+	_ = rwa.AckConnection("")
+	_, _ = io.Copy(rwa, rwa)
+	return nil
+}
+
+func TestServeUDPSession(t *testing.T) {
+	// Start a UDP Listener for QUIC.
+	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	udpListener, err := net.ListenUDP(udpAddr.Network(), udpAddr)
+	require.NoError(t, err)
+	defer func() { _ = udpListener.Close() }()
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	// Establish QUIC connection with edge
+	edgeQUICSessionChan := make(chan *quic.Conn)
+	go func() {
+		earlyListener, err := quic.Listen(udpListener, testTLSServerConfig, testQUICConfig)
+		assert.NoError(t, err)
+
+		edgeQUICSession, err := earlyListener.Accept(ctx)
+		assert.NoError(t, err)
+
+		edgeQUICSessionChan <- edgeQUICSession
+	}()
+
+	// Random index to avoid reusing port
+	tunnelConn, datagramConn := testTunnelConnection(t, netip.MustParseAddrPort(udpListener.LocalAddr().String()), 28)
+	go func() {
+		_ = tunnelConn.Serve(ctx)
+	}()
+
+	edgeQUICSession := <-edgeQUICSessionChan
+
+	serveSession(ctx, datagramConn, edgeQUICSession, closedByOrigin, io.EOF.Error(), t)
+	serveSession(ctx, datagramConn, edgeQUICSession, closedByTimeout, datagramsession.SessionIdleErr(time.Millisecond*50).Error(), t)
+	serveSession(ctx, datagramConn, edgeQUICSession, closedByRemote, "eyeball closed connection", t)
+	cancel()
+}
+
+func TestNopCloserReadWriterCloseBeforeEOF(t *testing.T) {
+	readerWriter := nopCloserReadWriter{readWriteCloser: &mockReaderNoopWriter{Reader: strings.NewReader("123456789")}}
+	buffer := make([]byte, 5)
+
+	n, err := readerWriter.Read(buffer)
+	require.NoError(t, err)
+	require.Equal(t, 5, n)
+
+	// close
+	require.NoError(t, readerWriter.Close())
+
+	// read should get error
+	n, err = readerWriter.Read(buffer)
+	require.Equal(t, 0, n)
+	require.Equal(t, err, fmt.Errorf("closed by handler"))
+}
+
+func TestNopCloserReadWriterCloseAfterEOF(t *testing.T) {
+	readerWriter := nopCloserReadWriter{readWriteCloser: &mockReaderNoopWriter{Reader: strings.NewReader("123456789")}}
+	buffer := make([]byte, 20)
+
+	n, err := readerWriter.Read(buffer)
+	require.NoError(t, err)
+	require.Equal(t, 9, n)
+
+	// force another read to read eof
+	_, err = readerWriter.Read(buffer)
+	require.Equal(t, err, io.EOF)
+
+	// close
+	require.NoError(t, readerWriter.Close())
+
+	// read should get EOF still
+	n, err = readerWriter.Read(buffer)
+	require.Equal(t, 0, n)
+	require.Equal(t, err, io.EOF)
+}
+
+func TestNopCloserReadWriterCloseUnblocksPendingRead(t *testing.T) {
+	t.Parallel()
+
+	stream := newBlockingReadWriteCloser()
+	t.Cleanup(stream.closeRead)
+
+	readerWriter := nopCloserReadWriter{readWriteCloser: stream}
+	readResult := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 1)
+		n, err := readerWriter.Read(buffer)
+		if n != 0 {
+			readResult <- fmt.Errorf("expected no bytes from unblocked read, got %d", n)
+			return
+		}
+		readResult <- err
+	}()
+
+	select {
+	case <-stream.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Read to block")
+	}
+
+	require.NoError(t, readerWriter.Close())
+
+	select {
+	case err := <-readResult:
+		require.ErrorIs(t, err, errBlockingReadClosed)
+	case <-time.After(time.Second):
+		t.Fatal("nopCloserReadWriter.Close did not unblock the pending Read")
+	}
+
+	n, err := readerWriter.Write([]byte("response"))
+	require.NoError(t, err)
+	require.Equal(t, len("response"), n)
+}
+
+func TestCreateUDPConnReuseSourcePort(t *testing.T) {
+	edgeIPv4 := netip.MustParseAddrPort("0.0.0.0:0")
+	edgeIPv6 := netip.MustParseAddrPort("[::]:0")
+
+	// We assume the test environment has access to an IPv4 interface
+	testCreateUDPConnReuseSourcePortForEdgeIP(t, edgeIPv4)
+
+	if nettest.SupportsIPv6() {
+		testCreateUDPConnReuseSourcePortForEdgeIP(t, edgeIPv6)
+	}
+}
+
+// TestTCPProxy_FlowRateLimited tests if the pogs.ConnectResponse returns the expected error and metadata, when a
+// new flow is rate limited.
+func TestTCPProxy_FlowRateLimited(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+
+	// Start a UDP Listener for QUIC.
+	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	udpListener, err := net.ListenUDP(udpAddr.Network(), udpAddr)
+	require.NoError(t, err)
+	defer func() { _ = udpListener.Close() }()
+
+	quicTransport := &quic.Transport{Conn: udpListener, ConnectionIDLength: 16}
+	quicListener, err := quicTransport.Listen(testTLSServerConfig, testQUICConfig)
+	require.NoError(t, err)
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+
+		session, err := quicListener.Accept(ctx)
+		assert.NoError(t, err)
+
+		quicStream, err := session.OpenStreamSync(t.Context())
+		assert.NoError(t, err)
+		stream := cfdquic.NewSafeStreamCloser(quicStream, defaultQUICTimeout, &log)
+
+		reqClientStream := rpcquic.RequestClientStream{ReadWriteCloser: stream}
+		err = reqClientStream.WriteConnectRequestData("rate-limit-me", pogs.ConnectionTypeTCP)
+		assert.NoError(t, err)
+
+		response, err := reqClientStream.ReadConnectResponseData()
+		assert.NoError(t, err)
+
+		// Got Rate Limited
+		assert.NotEmpty(t, response.Error)
+		assert.Contains(t, response.Metadata, pogs.ErrorFlowConnectRateLimitedMetadata)
+	}()
+
+	tunnelConn, _ := testTunnelConnection(t, netip.MustParseAddrPort(udpListener.LocalAddr().String()), uint8(0))
+
+	connDone := make(chan struct{})
+	go func() {
+		defer close(connDone)
+		_ = tunnelConn.Serve(ctx)
+	}()
+
+	<-serverDone
+	cancel()
+	<-connDone
+}
+
+func testCreateUDPConnReuseSourcePortForEdgeIP(t *testing.T, edgeIP netip.AddrPort) {
+	logger := zerolog.Nop()
+	conn, err := createUDPConnForConnIndex(0, nil, edgeIP, dialopts.DialOpts{}, &logger)
+	require.NoError(t, err)
+
+	getPortFunc := func(conn *net.UDPConn) int {
+		addr := conn.LocalAddr().(*net.UDPAddr)
+		return addr.Port
+	}
+
+	initialPort := getPortFunc(conn)
+
+	// close conn
+	_ = conn.Close()
+
+	// should get the same port as before.
+	conn, err = createUDPConnForConnIndex(0, nil, edgeIP, dialopts.DialOpts{}, &logger)
+	require.NoError(t, err)
+	require.Equal(t, initialPort, getPortFunc(conn))
+
+	// new index, should get a different port
+	conn1, err := createUDPConnForConnIndex(1, nil, edgeIP, dialopts.DialOpts{}, &logger)
+	require.NoError(t, err)
+	require.NotEqual(t, initialPort, getPortFunc(conn1))
+
+	// not closing the conn and trying to obtain a new conn for same index should give a different random port
+	conn, err = createUDPConnForConnIndex(0, nil, edgeIP, dialopts.DialOpts{}, &logger)
+	require.NoError(t, err)
+	require.NotEqual(t, initialPort, getPortFunc(conn))
+}
+
+// TestSkipPortReuse tests that skipPortReuse uses a random ephemeral port for each dial.
+func TestSkipPortReuse(t *testing.T) {
+	t.Parallel()
+	logger := zerolog.Nop()
+	edgeIP := netip.MustParseAddrPort("127.0.0.1:0")
+
+	// First dial with skipPortReuse should allocate a random port
+	conn1, err := createUDPConnForConnIndex(0, nil, edgeIP, dialopts.DialOpts{SkipPortReuse: true}, &logger)
+	require.NoError(t, err)
+	port1 := conn1.LocalAddr().(*net.UDPAddr).Port
+
+	// Don't close conn1 yet - keep it open to prevent port reuse
+	// Second dial with skipPortReuse should allocate a different random port
+	conn2, err := createUDPConnForConnIndex(0, nil, edgeIP, dialopts.DialOpts{SkipPortReuse: true}, &logger)
+	require.NoError(t, err)
+	port2 := conn2.LocalAddr().(*net.UDPAddr).Port
+
+	// Now close both connections
+	_ = conn1.Close()
+	_ = conn2.Close()
+	// With skipPortReuse, ports should be different (random allocation)
+	require.NotEqual(t, port1, port2, "With skipPortReuse, each dial should use a different random port")
+}
+
+// TestDialQuicWithSkipPortReuse tests that DialQuic works correctly with the WithSkipPortReuse option.
+func TestDialQuicWithSkipPortReuse(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// Start a mock QUIC server (similar to TestQUICServer)
+	udpListener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	require.NoError(t, err)
+	defer func() { _ = udpListener.Close() }()
+
+	serverAddr := netip.MustParseAddrPort(udpListener.LocalAddr().String())
+
+	quicTransport := &quic.Transport{Conn: udpListener, ConnectionIDLength: 16}
+	quicListener, err := quicTransport.Listen(testTLSServerConfig, testQUICConfig)
+	require.NoError(t, err)
+
+	serverDone := make(chan struct{})
+	go func() {
+		// Accept one connection
+		session, err := quicListener.Accept(ctx)
+		if err != nil {
+			close(serverDone)
+			return
+		}
+		// Keep session open until context is cancelled
+		<-ctx.Done()
+		_ = session.CloseWithError(0, "test done")
+		close(serverDone)
+	}()
+
+	// Test DialQuic with WithSkipPortReuse option
+	tlsClientConfig := &tls.Config{
+		// nolint: gosec
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"argotunnel"},
+	}
+
+	log := zerolog.New(io.Discard)
+	dialCtx, dialCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer dialCancel()
+
+	// Dial with skipPortReuse option - should use a random ephemeral port
+	conn, err := DialQuic(
+		dialCtx,
+		testQUICConfig,
+		tlsClientConfig,
+		serverAddr,
+		nil, // connect on a random port
+		0,
+		&log,
+		dialopts.DialOpts{SkipPortReuse: true},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+
+	// Verify we can get connection state
+	_ = conn.ConnectionState()
+
+	// Clean up
+	_ = conn.CloseWithError(0, "test done")
+	cancel()
+	<-serverDone
+}
+
+func serveSession(ctx context.Context, datagramConn *datagramV2Connection, edgeQUICSession cfdquic.QUICConnection, closeType closeReason, expectedReason string, t *testing.T) {
+	payload := []byte(t.Name())
+	sessionID := uuid.New()
+	cfdConn, originConn := net.Pipe()
+	// Registers and run a new session
+	session, err := datagramConn.sessionManager.RegisterSession(ctx, sessionID, cfdConn)
+	require.NoError(t, err)
+
+	sessionDone := make(chan struct{})
+	go func() {
+		datagramConn.serveUDPSession(session, time.Millisecond*50)
+		close(sessionDone)
+	}()
+
+	// Send a message to the quic session on edge side, it should be deumx to this datagram v2 session
+	muxedPayload, err := cfdquic.SuffixSessionID(sessionID, payload)
+	require.NoError(t, err)
+	muxedPayload, err = cfdquic.SuffixType(muxedPayload, cfdquic.DatagramTypeUDP)
+	require.NoError(t, err)
+
+	err = edgeQUICSession.SendDatagram(muxedPayload)
+	require.NoError(t, err)
+
+	readBuffer := make([]byte, len(payload)+1)
+	n, err := originConn.Read(readBuffer)
+	require.NoError(t, err)
+	require.Equal(t, len(payload), n)
+	require.True(t, bytes.Equal(payload, readBuffer[:n]))
+
+	// Close connection to terminate session
+	switch closeType {
+	case closedByOrigin:
+		_ = originConn.Close()
+	case closedByRemote:
+		err = datagramConn.UnregisterUdpSession(ctx, sessionID, expectedReason)
+		require.NoError(t, err)
+	case closedByTimeout:
+	}
+
+	if closeType != closedByRemote {
+		// Session was not closed by remote, so closeUDPSession should be invoked to unregister from remote
+		unregisterFromEdgeChan := make(chan struct{})
+		sessionRPCServer := &mockSessionRPCServer{
+			sessionID:            sessionID,
+			unregisterReason:     expectedReason,
+			calledUnregisterChan: unregisterFromEdgeChan,
+		}
+		// nolint: testifylint
+		go runRPCServer(ctx, edgeQUICSession, sessionRPCServer, nil, t)
+
+		<-unregisterFromEdgeChan
+	}
+
+	<-sessionDone
+}
+
+type closeReason uint8
+
+const (
+	closedByOrigin closeReason = iota
+	closedByRemote
+	closedByTimeout
+)
+
+func runRPCServer(ctx context.Context, session cfdquic.QUICConnection, sessionRPCServer pogs.SessionManager, configRPCServer pogs.ConfigurationManager, t *testing.T) {
+	stream, err := session.AcceptStream(ctx)
+	require.NoError(t, err)
+
+	if stream.StreamID() == 0 {
+		// Skip the first stream, it's the control stream of the QUIC connection
+		stream, err = session.AcceptStream(ctx)
+		require.NoError(t, err)
+	}
+	ss := rpcquic.NewCloudflaredServer(
+		func(_ context.Context, _ *rpcquic.RequestServerStream) error {
+			return nil
+		},
+		sessionRPCServer,
+		configRPCServer,
+		10*time.Second,
+	)
+	err = ss.Serve(ctx, stream)
+	assert.NoError(t, err)
+}
+
+type mockSessionRPCServer struct {
+	sessionID            uuid.UUID
+	unregisterReason     string
+	calledUnregisterChan chan struct{}
+}
+
+func (s mockSessionRPCServer) RegisterUdpSession(ctx context.Context, sessionID uuid.UUID, dstIP net.IP, dstPort uint16, closeIdleAfter time.Duration, traceContext string) (*pogs.RegisterUdpSessionResponse, error) {
+	return nil, fmt.Errorf("mockSessionRPCServer doesn't implement RegisterUdpSession")
+}
+
+func (s mockSessionRPCServer) UnregisterUdpSession(ctx context.Context, sessionID uuid.UUID, reason string) error {
+	if s.sessionID != sessionID {
+		return fmt.Errorf("expect session ID %s, got %s", s.sessionID, sessionID)
+	}
+	if s.unregisterReason != reason {
+		return fmt.Errorf("expect unregister reason %s, got %s", s.unregisterReason, reason)
+	}
+	close(s.calledUnregisterChan)
+	return nil
+}
+
+func testTunnelConnection(t *testing.T, serverAddr netip.AddrPort, index uint8) (TunnelConnection, *datagramV2Connection) {
+	return testTunnelConnectionWithConfig(t, serverAddr, index, testQUICConfig, &mockOriginProxyWithRequest{})
+}
+
+func testTunnelConnectionWithConfig(
+	t *testing.T,
+	serverAddr netip.AddrPort,
+	index uint8,
+	quicConfig *quic.Config,
+	originProxy OriginProxy,
+) (TunnelConnection, *datagramV2Connection) {
+	tlsClientConfig := &tls.Config{
+		// nolint: gosec
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"argotunnel"},
+	}
+	// Start a mock httpProxy
+	log := zerolog.New(io.Discard)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// Dial the QUIC connection to the edge
+	conn, err := DialQuic(
+		ctx,
+		quicConfig,
+		tlsClientConfig,
+		serverAddr,
+		nil, // connect on a random port
+		index,
+		&log,
+		dialopts.DialOpts{},
+	)
+	require.NoError(t, err)
+
+	// Start a session manager for the connection
+	sessionDemuxChan := make(chan *packet.Session, 4)
+	datagramMuxer := cfdquic.NewDatagramMuxerV2(conn, &log, sessionDemuxChan)
+	sessionManager := datagramsession.NewManager(&log, datagramMuxer.SendToSession, sessionDemuxChan)
+	var connIndex uint8 = 0
+	packetRouter := ingress.NewPacketRouter(nil, datagramMuxer, connIndex, &log)
+	testDefaultDialer := ingress.NewDialer(ingress.WarpRoutingConfig{
+		ConnectTimeout: config.CustomDuration{Duration: 1 * time.Second},
+		TCPKeepAlive:   config.CustomDuration{Duration: 15 * time.Second},
+		MaxActiveFlows: 0,
+	})
+	originDialer := ingress.NewOriginDialer(ingress.OriginConfig{
+		DefaultDialer:   testDefaultDialer,
+		TCPWriteTimeout: 1 * time.Second,
+	}, &log)
+
+	datagramConn := &datagramV2Connection{
+		conn,
+		index,
+		sessionManager,
+		cfdflow.NewLimiter(0),
+		datagramMuxer,
+		originDialer,
+		packetRouter,
+		15 * time.Second,
+		0 * time.Second,
+		&log,
+	}
+
+	tunnelConn := NewTunnelConnection(
+		ctx,
+		conn,
+		index,
+		&mockOrchestrator{originProxy: originProxy},
+		datagramConn,
+		fakeControlStream{},
+		&client.ConnectionOptionsSnapshot{},
+		15*time.Second,
+		0*time.Second,
+		0*time.Second,
+		&log,
+	)
+	return tunnelConn, datagramConn
+}
+
+type mockReaderNoopWriter struct {
+	io.Reader
+}
+
+func (m *mockReaderNoopWriter) Write(p []byte) (n int, err error) {
+	return len(p), nil
+}
+
+func (m *mockReaderNoopWriter) Close() error {
+	return nil
+}
+
+func (m *mockReaderNoopWriter) CloseRead() error {
+	return nil
+}
+
+type closeTrackingReadCloser struct {
+	io.Reader
+	closed bool
+}
+
+func (c *closeTrackingReadCloser) Close() error {
+	c.closed = true
+	return nil
+}
+
+var errBlockingReadClosed = errors.New("read side closed")
+
+type blockingReadWriteCloser struct {
+	readStarted chan struct{}
+	readClosed  chan struct{}
+	closeOnce   sync.Once
+}
+
+func newBlockingReadWriteCloser() *blockingReadWriteCloser {
+	return &blockingReadWriteCloser{
+		readStarted: make(chan struct{}),
+		readClosed:  make(chan struct{}),
+	}
+}
+
+func (b *blockingReadWriteCloser) Read(p []byte) (int, error) {
+	close(b.readStarted)
+	<-b.readClosed
+	return 0, errBlockingReadClosed
+}
+
+func (b *blockingReadWriteCloser) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (b *blockingReadWriteCloser) Close() error {
+	return nil
+}
+
+func (b *blockingReadWriteCloser) CloseRead() error {
+	b.closeRead()
+	return nil
+}
+
+func (b *blockingReadWriteCloser) closeRead() {
+	b.closeOnce.Do(func() {
+		close(b.readClosed)
+	})
+}
+
+type recordedQUICFrame struct {
+	sent  bool
+	frame any
+}
+
+type quicFrameRecorder struct {
+	frames chan recordedQUICFrame
+}
+
+func newQUICFrameRecorder() *quicFrameRecorder {
+	return &quicFrameRecorder{frames: make(chan recordedQUICFrame, 64)}
+}
+
+func (r *quicFrameRecorder) traceForConnection(context.Context, bool, qlog.ConnectionID) qlogwriter.Trace {
+	return r
+}
+
+func (r *quicFrameRecorder) AddProducer() qlogwriter.Recorder {
+	return r
+}
+
+func (r *quicFrameRecorder) SupportsSchemas(string) bool {
+	return true
+}
+
+func (r *quicFrameRecorder) RecordEvent(event qlogwriter.Event) {
+	var (
+		frames []qlog.Frame
+		sent   bool
+	)
+	switch event := event.(type) {
+	case qlog.PacketSent:
+		frames = event.Frames
+		sent = true
+	case qlog.PacketReceived:
+		frames = event.Frames
+	default:
+		return
+	}
+
+	for _, frame := range frames {
+		switch frame.Frame.(type) {
+		case *qlog.DataBlockedFrame, *qlog.StopSendingFrame, *qlog.ResetStreamFrame, *qlog.MaxDataFrame:
+			select {
+			case r.frames <- recordedQUICFrame{sent: sent, frame: frame.Frame}:
+			default:
+			}
+		}
+	}
+}
+
+func (r *quicFrameRecorder) Close() error {
+	return nil
+}
+
+func waitForQUICFrame(t *testing.T, frames <-chan recordedQUICFrame, matches func(recordedQUICFrame) bool) recordedQUICFrame {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+
+	for {
+		select {
+		case frame := <-frames:
+			if matches(frame) {
+				return frame
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for QUIC frame")
+		}
+	}
+}
+
+func waitForCloudflaredCancellationFrames(
+	t *testing.T,
+	frames <-chan recordedQUICFrame,
+	streamID quic.StreamID,
+) *qlog.MaxDataFrame {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+
+	var (
+		stopSending bool
+		resetStream bool
+		maxData     *qlog.MaxDataFrame
+	)
+	for {
+		select {
+		case event := <-frames:
+			switch frame := event.frame.(type) {
+			case *qlog.StopSendingFrame:
+				stopSending = stopSending || event.sent && frame.StreamID == streamID
+			case *qlog.ResetStreamFrame:
+				resetStream = resetStream || !event.sent && frame.StreamID == streamID
+			case *qlog.MaxDataFrame:
+				if event.sent {
+					maxData = frame
+				}
+			}
+			if stopSending && resetStream && maxData != nil {
+				return maxData
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for cloudflared QUIC cancellation frames")
+		}
+	}
+}
+
+func waitForEdgeCancellationFrames(t *testing.T, frames <-chan recordedQUICFrame, streamID quic.StreamID) {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+
+	var stopSending, resetStream bool
+	for {
+		select {
+		case event := <-frames:
+			switch frame := event.frame.(type) {
+			case *qlog.StopSendingFrame:
+				stopSending = stopSending || !event.sent && frame.StreamID == streamID
+			case *qlog.ResetStreamFrame:
+				resetStream = resetStream || event.sent && frame.StreamID == streamID
+			}
+			if stopSending && resetStream {
+				return
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for edge QUIC cancellation frames")
+		}
+	}
+}
+
+func waitForTestResult[T any](t *testing.T, results <-chan T) T {
+	t.Helper()
+	select {
+	case result := <-results:
+		return result
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for test result")
+		var zero T
+		return zero
+	}
+}
+
+// GenerateTLSConfig sets up a bare-bones TLS config for a QUIC server
+func GenerateTLSConfig() *tls.Config {
+	// nolint: gosec
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		panic(err)
+	}
+	template := x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		panic(err)
+	}
+	// nolint: gosec
+	return &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		NextProtos:   []string{"argotunnel"},
+	}
+}
