@@ -1,0 +1,20 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: cloudflared
+  description: Client for Cloudflare Tunnels
+  annotations:
+    cloudflare.com/software-excellence-opt-in: "true"
+    cloudflare.com/jira-project-key: "TUN"
+    cloudflare.com/jira-project-component: "Cloudflare Tunnel"
+  tags:
+    - internal
+spec:
+  type: "service"
+  lifecycle: "Active"
+  owner: "teams/tunnel-teams-routing"
+  cf:
+    compliance:
+      fedramp-high: "pending"
+      fedramp-moderate: "yes"
+    FIPS: "required"
